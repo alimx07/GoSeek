@@ -22,7 +22,7 @@ type Indexer interface {
 }
 
 type IndexStats struct {
-	TotalSize        uint64
+	TotalSize        int
 	DocumentsIndexed int
 }
 
