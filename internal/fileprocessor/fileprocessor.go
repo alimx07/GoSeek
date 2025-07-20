@@ -63,7 +63,7 @@ func (fp *FileProcessor) putBuilder(b *strings.Builder) {
 // TODO:
 // Try using fastwalk module (It is stated as being much faster than filepath.WalkDir)
 
-func (fp *FileProcessor) Walk(filePath string, fileChan chan<- string) {
+func (fp *FileProcessor) Walk(filePath string, fileChan chan<- string, updateChan chan string) {
 	// go StreamToIndex(w.chunkSize, w.numWorkers, fileChan, docChan)
 	err := filepath.WalkDir(filePath, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -72,7 +72,7 @@ func (fp *FileProcessor) Walk(filePath string, fileChan chan<- string) {
 		}
 		// println("Walker", "     ", path)
 		if d.IsDir() {
-			// fileChan <- path
+			updateChan <- path
 			return nil
 		}
 		ext := filepath.Ext(path)

@@ -22,7 +22,7 @@ type Coordinator struct {
 	fileprocessor *fileprocessor.FileProcessor
 	watcher       *watcher.FileWatcher
 	Indexer       *indexer.BleveIndexer
-	cfg           *config.Config
+	cfg           *config.IndexConfig
 
 	// Persistent channels
 	workChan chan WorkItem
@@ -30,26 +30,32 @@ type Coordinator struct {
 	docChan  chan *models.Document
 
 	// Worker control
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	ctx        context.Context
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
+	updateChan chan string
+	saveUpdate chan struct{}
 }
 
-func NewCoordinator(cfg *config.Config) *Coordinator {
+var gCfg *config.GlobalConfig = config.LoadGlobalConfig()
+
+func NewCoordinator(cfg *config.IndexConfig, saveUpdate chan struct{}) *Coordinator {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	coord := &Coordinator{
-		fileprocessor: fileprocessor.NewFileProcessor(cfg.AllowedExtensions, cfg.ChunkSize, cfg.NumWorkers),
-		Indexer:       indexer.NewBleveIndexer(cfg.IndexPath, cfg.IndexBatchMemoryLimit, cfg.NumWorkers),
+		fileprocessor: fileprocessor.NewFileProcessor(cfg.Extensions, gCfg.ChunkSize, gCfg.NumWorkers),
+		Indexer:       indexer.NewBleveIndexer(cfg.IndexPath, gCfg.IndexBatchMemoryLimit, gCfg.NumWorkers),
 		cfg:           cfg,
 
 		// channels
-		workChan: make(chan WorkItem, cfg.ChannelBufferSize*2),
-		fileChan: make(chan string, cfg.ChannelBufferSize*4),
-		docChan:  make(chan *models.Document, cfg.ChannelBufferSize),
+		workChan: make(chan WorkItem, gCfg.ChannelBufferSize*2),
+		fileChan: make(chan string, gCfg.ChannelBufferSize*4),
+		docChan:  make(chan *models.Document, gCfg.ChannelBufferSize),
 
-		ctx:    ctx,
-		cancel: cancel,
+		ctx:        ctx,
+		cancel:     cancel,
+		updateChan: make(chan string, 2),
+		saveUpdate: saveUpdate,
 	}
 
 	coord.watcher = watcher.NewFileWatcher(
@@ -69,13 +75,14 @@ func (c *Coordinator) startWorkers() {
 	c.wg.Add(1)
 	go c.workDispatcher()
 
-	for i := 0; i < c.cfg.NumWorkers/2; i++ {
+	for i := 0; i < gCfg.NumWorkers/2; i++ {
 		c.wg.Add(2)
 		// file processor pool
 		go c.fileProcess()
 		// Document indexer
 		go c.documentIndexer()
 	}
+	go c.AddDir()
 }
 
 func (c *Coordinator) workDispatcher() {
@@ -106,38 +113,23 @@ func (c *Coordinator) workDispatcher() {
 
 func (c *Coordinator) fileProcess() {
 	defer c.wg.Done()
-	mp := make(map[string]bool)
 	for {
 		select {
 		case <-c.ctx.Done():
 			return
 		case filePath := <-c.fileChan:
 
-			// To prevent infinite loop of visit dirs
-			if _, ok := mp[filePath]; ok {
-				delete(mp, filePath)
-				continue
-			}
-
-			// if It is New folder --> Walk and give me files in it
-			// If it file --> Just Process
-
 			file, err := os.Open(filePath)
 			if err != nil {
 				print(err)
-			}
-			info, _ := file.Stat()
-			if info.IsDir() {
-				mp[filePath] = true
-
-				// Start Watching file for changes
-				c.AddDir(filePath)
-
-				// Walk and send all files in dir on fileChan
-				c.fileprocessor.Walk(filePath, c.fileChan)
 				continue
 			}
-
+			info, _ := file.Stat()
+			// It is a folder --> Walk and give me the files
+			if info.IsDir() {
+				c.fileprocessor.Walk(filePath, c.fileChan, c.updateChan)
+				continue
+			}
 			// It is file then read its content
 			// send on docChan to start indexing
 			c.fileprocessor.Read(filePath, info, c.docChan)
@@ -168,7 +160,7 @@ func (c *Coordinator) documentIndexer() {
 			batchCount++
 
 			// Check if batch should be flushed
-			if batchSize >= c.cfg.IndexBatchMemoryLimit {
+			if batchSize >= gCfg.IndexBatchMemoryLimit {
 				flushBatch(batch, &batchSize, &batchCount)
 				batch = c.Indexer.NewBatch()
 			}
@@ -187,8 +179,12 @@ func (c *Coordinator) StartWatching() error {
 	return c.watcher.StartWatching()
 }
 
-func (c *Coordinator) AddDir(filePath string) {
-	c.watcher.Watcher.Add(filePath)
+func (c *Coordinator) AddDir() {
+	for folder := range c.updateChan {
+		c.watcher.Watcher.Add(folder)
+		c.cfg.Folders = append(c.cfg.Folders, folder)
+		c.saveUpdate <- struct{}{}
+	}
 }
 
 // Close the coordinator and
@@ -198,5 +194,6 @@ func (c *Coordinator) Shutdown() {
 	close(c.workChan)
 	close(c.fileChan)
 	close(c.docChan)
+	close(c.updateChan)
 	c.wg.Wait()
 }
