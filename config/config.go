@@ -1,37 +1,54 @@
 package config
 
 import (
-	"errors"
+	"os"
+	"path/filepath"
+
+	"gopkg.in/yaml.v3"
 )
 
-type Config struct {
-	RootPath              string
-	IndexPath             string
-	AllowedExtensions     map[string]bool
+type GlobalConfig struct {
 	ChunkSize             int
 	NumWorkers            int
-	WatcherIdleTime       int
 	IndexBatchMemoryLimit int
 	ChannelBufferSize     int
 }
 
-var (
-	ErrInvalidRootPath    = errors.New("invalid folder path")
-	ErrInvalidIndexPath   = errors.New("invalid index path")
-	ErrInvalidChunkSize   = errors.New("chunk size must be greater than 0")
-	ErrInvalidNumWorkers  = errors.New("number of workers must be greater than 0")
-	ErrInvalidBufferSize  = errors.New("channel buffer size must be greater than 0")
-	ErrInvalidMemoryLimit = errors.New("index batch memory limit must be greater than 0")
-	// ErrNoAllowedExtensions = errors.New("no allowed extensions specified")
-)
+type IndexConfig struct {
+	Name               string          `yaml:"name"`
+	Folders            []string        `yaml:"folders"`
+	IndexPath          string          `yaml:"index_path"`
+	PendingChangesPath string          `yaml:"pending_changes_path"`
+	Extensions         map[string]bool `yaml:"extensions"`
+}
 
-// The Config returns from user
-// right now just use some default values
-func LoadConfig() (*Config, error) {
-	return &Config{
-		RootPath:  ".",
-		IndexPath: "index.bleve",
-		AllowedExtensions: map[string]bool{
+type Config struct {
+	Indexes []*IndexConfig `yaml:"indexes"`
+	// TODO:
+	// Problem : Think of user write to file with auto save (multiple write events for every change)
+	// Add mechanism to wait some time (Delay)
+	// handle only last event
+	// DebounceDelayMs int           `yaml:"debounce_delay_ms"`
+	LogDir string `yaml:"log_dir"`
+}
+
+// Global configs of the app
+func LoadGlobalConfig() *GlobalConfig {
+	return &GlobalConfig{
+		ChunkSize:             1 * 1024 * 1024,
+		NumWorkers:            4,
+		IndexBatchMemoryLimit: 32 * 1024 * 1024,
+		ChannelBufferSize:     16,
+	}
+}
+
+// Configs that contains the metadata about index
+func NewIndexConfig(path string) (*IndexConfig, error) {
+	Name := filepath.Base(path)
+	return &IndexConfig{
+		Name:      path,
+		IndexPath: "../index/" + Name,
+		Extensions: map[string]bool{
 			".txt":  true,
 			".md":   true,
 			".json": true,
@@ -40,9 +57,27 @@ func LoadConfig() (*Config, error) {
 			".py":   true,
 			".java": true,
 		},
-		ChunkSize:             1 * 1024 * 1024,
-		NumWorkers:            4,
-		IndexBatchMemoryLimit: 32 * 1024 * 1024,
-		ChannelBufferSize:     16,
+		PendingChangesPath: "../pending_changes/" + Name + ".txt",
 	}, nil
+}
+
+func SaveConfigToYAML(config *Config, filePath string) error {
+	data, err := yaml.Marshal(config)
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(filePath, data, 0644)
+}
+
+func ReadYAMLToConfig(config *Config, filePath string) error {
+	file, err := os.ReadFile(filePath)
+	if err != nil {
+		return err
+	}
+	err = yaml.Unmarshal(file, config)
+	if err != nil {
+		return err
+	}
+	return nil
 }
