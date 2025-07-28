@@ -1,8 +1,8 @@
-package main
+package gui
 
 import (
+	"GoSeek/internal/models"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -29,48 +29,6 @@ const (
 )
 
 // Folder
-type Folder struct {
-	Name     string
-	Path     string
-	Children []*Folder
-}
-
-type SearchResult struct {
-	FileName  string
-	Score     float32
-	Size      int
-	Extension string
-	FilePath  string
-	ModTime   string
-}
-
-// Search in indexes
-func SearchDocuments(query string, exact, caseSensitive bool) []SearchResult {
-	return nil
-}
-
-// Read Data from Config.yaml
-func GetIndexedFolders() []*Folder {
-	return nil
-}
-
-func IndexFolder(path string) error {
-	// Mock indexing function
-	fmt.Printf("Indexing folder: %s\n", path)
-	time.Sleep(100 * time.Millisecond) // Simulate work
-	return nil
-}
-
-func RemoveFolder(path string) error {
-	// Mock removal function
-	fmt.Printf("Removing folder from index: %s\n", path)
-	return nil
-}
-
-// Open File in Content Preview section
-func GetDocumentPreview(path string) string {
-	return ""
-}
 
 // GUI Application
 type GUI struct {
@@ -81,9 +39,15 @@ type GUI struct {
 	resultsTable    *widget.Table
 	previewText     *widget.RichText
 	folderTree      *widget.Tree
-	searchResults   []SearchResult
+	tree            *treeContext
+	searchResults   []models.Document
 	excludedFolders map[string]bool
 	isDarkTheme     bool
+}
+
+type treeContext struct {
+	root      *Folder
+	treeCache map[string]*Folder // cache UID --> Folder
 }
 
 func NewApp() *GUI {
@@ -205,7 +169,7 @@ func (g *GUI) setupUI() {
 	g.initializeFolderTree()
 }
 
-func (g *GUI) updateSearchResults(results []SearchResult) {
+func (g *GUI) updateSearchResults(results []models.Document) {
 	g.searchResults = results
 	g.resultsTable.Refresh()
 
@@ -229,12 +193,13 @@ func (g *GUI) showFolderSelectionDialog(onSelected func(path string)) {
 	}, g.window)
 }
 
-func (g *GUI) handleFolderOperation(operation func() error, successMessage string) {
+func (g *GUI) handleFolderOperation(operation func() (*treeContext, error), successMessage string) {
 	go func() {
-		err := operation() // REMOVE OR UPDATE
+		tc, err := operation() // REMOVE OR UPDATE
 		if err != nil {
 			dialog.ShowError(err, g.window)
 		} else {
+			g.tree = tc
 			g.folderTree.Refresh()
 			if successMessage != "" {
 				dialog.ShowInformation("Success", successMessage, g.window)
@@ -254,7 +219,7 @@ func (g *GUI) setTableColumnWidths(table *widget.Table) {
 
 func (g *GUI) clearSearch() {
 	g.searchEntry.SetText("")
-	g.searchResults = []SearchResult{}
+	g.searchResults = []models.Document{}
 	g.resultsTable.Refresh()
 	g.previewText.ParseMarkdown("Select a search result to view preview...")
 }
@@ -319,7 +284,7 @@ func (g *GUI) createResultsTable() {
 			result := g.searchResults[id.Row]
 			switch id.Col {
 			case 0:
-				label.SetText(result.FileName)
+				label.SetText(result.Path)
 			case 1:
 				label.SetText(fmt.Sprintf("%.2f", result.Score))
 			case 2:
@@ -327,7 +292,7 @@ func (g *GUI) createResultsTable() {
 			case 3:
 				label.SetText(result.Extension)
 			case 4:
-				label.SetText(result.FilePath)
+				label.SetText(result.Path)
 			case 5:
 				label.SetText(result.ModTime)
 			}
@@ -339,7 +304,7 @@ func (g *GUI) createResultsTable() {
 	g.resultsTable.OnSelected = func(id widget.TableCellID) {
 		if id.Row < len(g.searchResults) {
 			result := g.searchResults[id.Row]
-			g.loadPreview(result.FilePath)
+			g.loadPreview(result.Path)
 		}
 	}
 }
@@ -350,68 +315,112 @@ func (g *GUI) createPreviewPanel() {
 	g.previewText.Wrapping = fyne.TextWrapWord
 }
 
+func (g *GUI) initTreeContext() {
+	root := GetIndexes()
+	g.tree = &treeContext{
+		root:      root,
+		treeCache: make(map[string]*Folder),
+	}
+}
+
+func (tc *treeContext) findFolder(UID widget.TreeNodeID) *Folder {
+	uidStr := strings.TrimSpace(string(UID))
+
+	if uidStr == "" {
+		return tc.root
+	}
+	if folder, ok := tc.treeCache[uidStr]; ok {
+		return folder
+	}
+
+	folder := tc.findFolderinTree(uidStr)
+	tc.treeCache[uidStr] = folder
+	return folder
+}
+
+func (tc *treeContext) findFolderinTree(uid string) *Folder {
+
+	parts := strings.Split(uid, "/")
+	currentFolder := tc.root
+
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+
+		if currentFolder.Children == nil {
+			return nil
+		}
+
+		if child, exists := currentFolder.Children[part]; exists {
+			currentFolder = child
+		} else {
+			return nil
+		}
+	}
+	return currentFolder
+}
+
 // ALL Folder and Tree Operations
 // need revisting , testing and Refactor
 // Just work for now
 func (g *GUI) createFolderTree() {
-
-	println("FOLDER TREE CREATION CALLED")
 	if g.excludedFolders == nil {
 		g.excludedFolders = make(map[string]bool)
 	}
 
+	g.initTreeContext()
+
 	g.folderTree = widget.NewTree(
 		func(uid widget.TreeNodeID) []widget.TreeNodeID {
-			println("=== CHILDREN FUNCTION CALLED for UID: '", string(uid), "' ===")
-			folders := GetIndexedFolders()
-			println("Available folders:", len(folders))
+
+			// Get the root folder trie
+			rootFolder := g.tree.root
+			if rootFolder == nil {
+				println("No root folder found")
+				return []widget.TreeNodeID{}
+			}
 
 			// Handle empty/whitespace UIDs (root level)
 			if strings.TrimSpace(string(uid)) == "" {
-				println("Root level - returning", len(folders), "root folders")
-				var ids []widget.TreeNodeID
-				for i := range folders {
-					id := widget.TreeNodeID(strconv.Itoa(i))
-					ids = append(ids, id)
-					println("  Root folder ID:", string(id), "for", folders[i].Name)
+				if len(rootFolder.Children) > 0 {
+					var ids []widget.TreeNodeID
+					for name := range rootFolder.Children {
+						id := widget.TreeNodeID(name)
+						ids = append(ids, id)
+					}
+					return ids
 				}
-				return ids
+				return []widget.TreeNodeID{}
 			}
 
-			folder := g.findFolder(uid, folders)
+			// Find the folder for this UID
+			folder := g.tree.findFolder(uid)
 			if folder != nil && len(folder.Children) > 0 {
-				println("Found folder:", folder.Name, "with", len(folder.Children), "children")
 				var ids []widget.TreeNodeID
-				for i := range folder.Children {
-					childID := widget.TreeNodeID(string(uid) + "-" + strconv.Itoa(i))
+				for name := range folder.Children {
+					childID := widget.TreeNodeID(string(uid) + "/" + name)
 					ids = append(ids, childID)
-					println("  Child ID:", string(childID), "for", folder.Children[i].Name)
 				}
 				return ids
 			}
 
-			println("No children for UID:", string(uid))
 			return []widget.TreeNodeID{}
 		},
 		func(uid widget.TreeNodeID) bool {
-			println("=== ISBRANCH FUNCTION CALLED for UID: '", string(uid), "' ===")
+
+			rootFolder := g.tree.root
+			if rootFolder == nil {
+				return false
+			}
 
 			if strings.TrimSpace(string(uid)) == "" {
-				folders := GetIndexedFolders()
-				hasFolders := len(folders) > 0
-				println("Root level UID - returning", hasFolders, "because we have", len(folders), "folders")
+				hasFolders := len(rootFolder.Children) > 0
 				return hasFolders
 			}
 
-			folders := GetIndexedFolders()
-			folder := g.findFolder(uid, folders)
+			folder := g.tree.findFolder(uid)
 			hasBranch := folder != nil && len(folder.Children) > 0
-			println("IsBranch result:", hasBranch)
-			if folder != nil {
-				println("  Folder:", folder.Name, "Children:", len(folder.Children))
-			} else {
-				println("  No folder found for UID:", string(uid))
-			}
 			return hasBranch
 		},
 		func(branch bool) fyne.CanvasObject {
@@ -428,113 +437,77 @@ func (g *GUI) createFolderTree() {
 			)
 		},
 		func(uid widget.TreeNodeID, branch bool, node fyne.CanvasObject) {
-			println("=== UPDATE FUNCTION CALLED for UID: '", string(uid), "' ===")
 
 			if strings.TrimSpace(string(uid)) == "" {
-				println("Empty UID in update function - skipping")
 				return
 			}
 
-			folders := GetIndexedFolders()
-			folder := g.findFolder(uid, folders)
+			rootFolder := g.tree.root
+			if rootFolder == nil {
+				return
+			}
+
+			folder := g.tree.findFolder(uid)
 			if folder != nil {
 				box := node.(*fyne.Container)
 				check := box.Objects[1].(*widget.Check)
 				label := box.Objects[2].(*widget.Label)
 
 				label.SetText(folder.Name)
-				println("Updating node label to:", folder.Name)
+
+				// Create a path for the folder for exclusion tracking
+				folderPath := g.getFolderPath(uid)
 
 				// Update checkbox state
-				check.SetChecked(!g.excludedFolders[folder.Path])
+				check.SetChecked(!g.excludedFolders[folderPath])
 
 				// Handle user interaction
 				check.OnChanged = func(checked bool) {
 					if checked {
-						delete(g.excludedFolders, folder.Path)
+						delete(g.excludedFolders, folderPath)
 					} else {
-						g.excludedFolders[folder.Path] = true
+						g.excludedFolders[folderPath] = true
 					}
 				}
-			} else {
-				println("No folder found for UID in update function:", string(uid))
 			}
 		},
 	)
 
 	g.folderTree.OnSelected = func(uid widget.TreeNodeID) {
 		println("Tree node selected:", string(uid))
-		if strings.Contains(string(uid), "-") {
+
+		rootFolder := g.tree.root
+		if rootFolder == nil {
 			return
 		}
 
-		folders := GetIndexedFolders()
-		folder := g.findFolder(uid, folders)
+		folder := g.tree.findFolder(uid)
 		if folder != nil {
 			g.showFolderContextMenu(folder)
 		}
 	}
 }
 
-func (g *GUI) findFolder(uid widget.TreeNodeID, folders []*Folder) *Folder {
-	println("=== FIND FOLDER CALLED for UID: '", string(uid), "' ===")
-	uidStr := strings.TrimSpace(string(uid))
-	if uidStr == "" {
-		println("Empty UID - returning nil")
-		return nil
-	}
+// New helper function to find folder in the trie structure
 
-	parts := strings.Split(uidStr, "-")
-	if len(parts) == 0 {
-		println("No parts found - returning nil")
-		return nil
-	}
-
-	index, err := strconv.Atoi(parts[0])
-	if err != nil {
-		println("Error parsing index:", err)
-		return nil
-	}
-
-	if index >= len(folders) {
-		println("Index", index, "out of range, max:", len(folders)-1)
-		return nil
-	}
-
-	folder := folders[index]
-	println("Found root folder:", folder.Name, "at index", index)
-
-	for i := 1; i < len(parts); i++ {
-		childIndex, err := strconv.Atoi(parts[i])
-		if err != nil {
-			println("Error parsing child index:", err)
-			return nil
-		}
-
-		if childIndex >= len(folder.Children) {
-			println("Child index", childIndex, "out of range for", folder.Name)
-			return nil
-		}
-
-		folder = folder.Children[childIndex]
-		println("Navigated to child:", folder.Name)
-	}
-
-	println("Final folder found:", folder.Name)
-	return folder
+// Helper function to get the full path of a folder from UID
+func (g *GUI) getFolderPath(uid widget.TreeNodeID) string {
+	return string(uid) // For now, use the UID as the path
 }
 
+// Update initializeFolderTree to work with the new trie structure
 func (g *GUI) initializeFolderTree() {
-	println("=== INITIALIZING FOLDER TREE ===")
+	rootFolder := g.tree.root
+	if rootFolder == nil {
+		return
+	}
 
-	folders := GetIndexedFolders()
-	println("Folders available for initialization:", len(folders))
-
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(250 * time.Millisecond)
 	g.folderTree.Refresh()
-	for i := range folders {
-		node := widget.TreeNodeID(strconv.Itoa(i))
-		println("Attempting to open branch for node:", string(node))
+
+	// Open all first-level branches
+	for name := range rootFolder.Children {
+		node := widget.TreeNodeID(name)
 
 		fyne.DoAndWait(func() {
 			g.folderTree.OpenBranch(node)
@@ -542,39 +515,68 @@ func (g *GUI) initializeFolderTree() {
 	}
 
 	g.folderTree.Refresh()
-	println("=== Tree initialization complete ===")
 }
 
 func (g *GUI) showFolderContextMenu(folder *Folder) {
 	menu := fyne.NewMenu("Folder Actions",
 		fyne.NewMenuItem("Reindex", func() {
-			g.reindexFolder(folder.Path)
+			g.reindexFolder(folder.Name)
 		}),
 		fyne.NewMenuItem("Remove from Index", func() {
-			g.removeFolderFromIndex(folder.Path)
+			g.removeFolderFromIndex(folder.Name)
 		}),
 	)
 
 	widget.ShowPopUpMenuAtPosition(menu, g.window.Canvas(), fyne.CurrentApp().Driver().AbsolutePositionForObject(g.folderTree))
 }
 
+func (g *GUI) getCheckedFolders() []string {
+	var checkedFolders []string
+
+	g.walkTree("", g.tree.root, func(path string) {
+		if !g.excludedFolders[path] {
+			checkedFolders = append(checkedFolders, path)
+		}
+	})
+	return checkedFolders
+}
+
+func (g *GUI) walkTree(currPath string, folder *Folder, callback func(string)) {
+
+	if folder == nil {
+		return
+	}
+	if currPath != "" {
+		callback(currPath)
+	}
+	for name, child := range folder.Children {
+		childPath := currPath
+		if childPath == "" {
+			childPath = name
+		} else {
+			childPath = currPath + "/" + name
+		}
+		g.walkTree(childPath, child, callback)
+	}
+}
 func (g *GUI) performSearch() {
 	query := g.searchEntry.Text
 	if query == "" {
 		return
 	}
 
-	sizeFilter := g.sizeFilter.Selected
+	// sizeFilter := g.sizeFilter.Selected
 
 	g.previewText.ParseMarkdown("Searching...")
 
 	go func() {
-		results := SearchDocuments(query, false, false)
+		folders := g.getCheckedFolders()
+		results := SearchDocuments(query, folders)
 
-		if sizeFilter != "Any Size" {
-			fmt.Printf("Applying size filter: %s\n", sizeFilter)
+		// if sizeFilter != "Any Size" {
+		// 	fmt.Printf("Applying size filter: %s\n", sizeFilter)
 
-		}
+		// }
 
 		g.updateSearchResults(results)
 	}()
@@ -585,12 +587,12 @@ func (g *GUI) loadPreview(filePath string) {
 	g.previewText.ParseMarkdown("Loading preview...")
 
 	go func() {
-		preview := GetDocumentPreview(filePath)
+		preview, err := GetDocumentPreview(filePath)
 
 		if preview != "" {
 			g.previewText.ParseMarkdown(preview)
 		} else {
-			g.previewText.ParseMarkdown("No preview available for this file.")
+			g.previewText.ParseMarkdown(err.Error())
 		}
 	}()
 }
@@ -598,7 +600,7 @@ func (g *GUI) loadPreview(filePath string) {
 func (g *GUI) reindexFolder(path string) {
 	dialog.ShowInformation("Reindexing", fmt.Sprintf("Reindexing folder: %s", path), g.window)
 
-	g.handleFolderOperation(func() error {
+	g.handleFolderOperation(func() (*treeContext, error) {
 		return IndexFolder(path)
 	}, "")
 }
@@ -608,7 +610,7 @@ func (g *GUI) removeFolderFromIndex(path string) {
 		fmt.Sprintf("Are you sure you want to remove '%s' from the index?", path),
 		func(confirmed bool) {
 			if confirmed {
-				g.handleFolderOperation(func() error {
+				g.handleFolderOperation(func() (*treeContext, error) {
 					return RemoveFolder(path)
 				}, "")
 			}
@@ -643,35 +645,26 @@ func (g *GUI) startIndexing(folderPath string) {
 	progressDialog := dialog.NewInformation("Indexing", "Indexing folder: "+folderPath+"\n\nPlease wait...", g.window)
 	progressDialog.Show()
 
-	go func() {
-		// Simulate indexing process
-		err := IndexFolder(folderPath)
+	// Simulate indexing process
+	tc, err := IndexFolder(folderPath)
 
-		progressDialog.Hide()
+	progressDialog.Hide()
 
-		if err != nil {
-			dialog.ShowError(fmt.Errorf("failed to index folder: %v", err), g.window)
-		} else {
+	if err != nil {
+		dialog.ShowError(fmt.Errorf("failed to index folder: %v", err), g.window)
+	} else {
+		// g.initTreeContext()
+		dialog.ShowInformation("Success",
+			fmt.Sprintf("Successfully created index for:\n%s\n\nThe folder has been added to your indexed folders.", folderPath),
+			g.window)
 
-			dialog.ShowInformation("Success",
-				fmt.Sprintf("Successfully created index for:\n%s\n\nThe folder has been added to your indexed folders.", folderPath),
-				g.window)
-
-			g.folderTree.Refresh()
-			g.clearSearch()
-			g.previewText.ParseMarkdown("Index created successfully. Enter search terms to begin searching.")
-		}
-	}()
+		g.tree = tc
+		g.folderTree.Refresh()
+		g.clearSearch()
+		g.previewText.ParseMarkdown("Index created successfully. Enter search terms to begin searching.")
+	}
 }
 
 func (g *GUI) Run() {
 	g.window.ShowAndRun()
-}
-
-func main() {
-	// TODO:
-	// Use Threads to ensure low latency
-	// Refactor & Integrate
-	gui := NewApp()
-	gui.Run()
 }
