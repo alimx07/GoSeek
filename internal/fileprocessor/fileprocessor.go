@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -16,13 +17,15 @@ type FileProcessor struct {
 	allowedExtensions map[string]bool
 	bufferPool        sync.Pool
 	builderPool       sync.Pool
+	base              string
 }
 
 // NewWalker returns a pointer to Walker Instance standing
 // on current root path and intersted in specific files with extensions in allowedExtensions slice
 
-func NewFileProcessor(allowedExtensions map[string]bool, chunksize, numWorkers int) *FileProcessor {
+func NewFileProcessor(base string, allowedExtensions map[string]bool, chunksize, numWorkers int) *FileProcessor {
 	fp := &FileProcessor{
+		base:              base,
 		allowedExtensions: allowedExtensions,
 	}
 	fp.builderPool = sync.Pool{
@@ -87,7 +90,7 @@ func (fp *FileProcessor) Walk(filePath string, fileChan chan<- string, updateCha
 	}
 }
 
-func (fp *FileProcessor) Read(filePath string, info os.FileInfo, docChan chan<- *models.Document) error {
+func (fp *FileProcessor) Read(filePath string, info os.FileInfo, docChan chan<- *models.Document, filesRead *int32) error {
 
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -116,7 +119,14 @@ func (fp *FileProcessor) Read(filePath string, info os.FileInfo, docChan chan<- 
 	ext := filepath.Ext(filePath)
 	modtime := info.ModTime().Format(time.RFC1123)
 	size := info.Size()
-	docChan <- models.NewDocument(filePath, size, modtime, ext, content.String())
+	atomic.AddInt32(filesRead, 1)
+	relPath, err := filepath.Rel(fp.base, filePath)
+	if err != nil {
+		println(err.Error())
+		relPath = filePath
+	}
+	// println(filePath, "    ", relPath)
+	docChan <- models.NewDocument(relPath, size, modtime, ext, content.String())
 	fp.putBuffer(&buffer)
 	fp.putBuilder(content)
 	file.Close() // DONE
