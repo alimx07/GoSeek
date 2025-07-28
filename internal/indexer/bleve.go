@@ -2,10 +2,12 @@ package indexer
 
 import (
 	// "GoSeek/config"
-	"GoSeek/internal/db"
+
 	"GoSeek/internal/models"
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"sync"
@@ -14,12 +16,9 @@ import (
 )
 
 type BleveIndexer struct {
-	Index_m           bleve.Index
-	MaxLimitBatchSize int
-	stats             IndexStats
-	statsLock         sync.Mutex
-	DB                *db.DB
-	numWorkers        int
+	Index     bleve.Index
+	stats     IndexStats
+	statsLock sync.Mutex
 }
 
 // NewBleveIndexer creates a new BleveIndexer in specific path
@@ -31,11 +30,14 @@ type BleveIndexer struct {
 // Make configurations more customized according to user choices
 // Handle indexPath operations and Cases (already found index in this path , Rename by user op , etc..)
 
-func NewBleveIndexer(indexpath string, batchLimit int, numWorkers int) *BleveIndexer {
+func NewBleveIndexer(folderPath string, extensions map[string]bool) (*BleveIndexer, error) {
 
-	// IF IT IS FOUND , JUST DELETE FOR NOW
-	if _, err := os.Stat(indexpath); err == nil {
-		os.RemoveAll(indexpath)
+	// IF IT IS FOUND RETURN IT
+	indexpath := "index/" + filepath.Base(folderPath)
+	currIndex := OpenBleve(indexpath)
+	if currIndex != nil {
+		currIndex.Index.Close()
+		return nil, fmt.Errorf("there is already index with that path")
 	}
 
 	indexMapping := bleve.NewIndexMapping()
@@ -45,6 +47,13 @@ func NewBleveIndexer(indexpath string, batchLimit int, numWorkers int) *BleveInd
 	contentField.Index = true
 	contentField.Store = false
 	contentField.IncludeTermVectors = false // Enable it for highlighting words feature
+
+	dirFiled := bleve.NewTextFieldMapping()
+	dirFiled.Index = true
+	dirFiled.Store = true // Store the path so we can retrieve it
+	dirFiled.IncludeTermVectors = false
+	dirFiled.IncludeInAll = false
+	dirFiled.Analyzer = "keyword"
 
 	sizeField := bleve.NewNumericFieldMapping()
 	sizeField.Index = false
@@ -65,6 +74,7 @@ func NewBleveIndexer(indexpath string, batchLimit int, numWorkers int) *BleveInd
 	extensionField.IncludeInAll = false
 
 	documentMapping := bleve.NewDocumentMapping()
+	documentMapping.AddFieldMappingsAt("dir", dirFiled)
 	documentMapping.AddFieldMappingsAt("content", contentField)
 	documentMapping.AddFieldMappingsAt("size", sizeField)
 	documentMapping.AddFieldMappingsAt("mod_time", modTimeField)
@@ -81,23 +91,48 @@ func NewBleveIndexer(indexpath string, batchLimit int, numWorkers int) *BleveInd
 
 	index, err := bleve.NewUsing(indexpath, indexMapping, bleve.Config.DefaultIndexType, "scorch", nil)
 	if err != nil {
+		return nil, err
+	}
+	data, _ := json.Marshal(extensions)
+
+	err = index.SetInternal([]byte("__extensions__"), data)
+	if err != nil {
+		return nil, err
+	}
+	err = index.SetInternal([]byte("__base_path__"), []byte(filepath.Dir(folderPath)))
+	if err != nil {
+		return nil, err
+	}
+	return &BleveIndexer{
+		Index: index,
+		stats: IndexStats{},
+	}, nil
+}
+
+func OpenBleve(indexpath string) *BleveIndexer {
+	_, err := os.Stat(indexpath)
+	if err != nil {
+		println(err)
+		return nil
+	}
+	var index bleve.Index
+	index, err = bleve.Open(indexpath)
+	if err != nil {
 		return nil
 	}
 	return &BleveIndexer{
-		Index_m:           index,
-		stats:             IndexStats{},
-		MaxLimitBatchSize: batchLimit,
-		numWorkers:        numWorkers,
+		Index: index,
+		stats: IndexStats{},
 	}
 }
 
 func (bi *BleveIndexer) BatchIndex(batch *bleve.Batch) error {
-	return bi.Index_m.Batch(batch)
+	return bi.Index.Batch(batch)
 }
 
 // NewBatch - Create new batch
 func (bi *BleveIndexer) NewBatch() *bleve.Batch {
-	return bi.Index_m.NewBatch()
+	return bi.Index.NewBatch()
 }
 
 // IndexDocument - Index single document to batch
@@ -106,11 +141,15 @@ func (bi *BleveIndexer) IndexDocument(batch *bleve.Batch, doc *models.Document) 
 }
 
 // DeleteDocument - Delete document from index
-func (bi *BleveIndexer) DeleteDocument(batch *bleve.Batch, filePath string) {
+func (bi *BleveIndexer) DeleteDocumentBatch(batch *bleve.Batch, filePath string) {
 	batch.Delete(filePath)
 }
 
-func (bi *BleveIndexer) FlushBatch(batch *bleve.Batch, batchSize, batchCount *int) {
+func (bi *BleveIndexer) DeleteSingleDocument(filePath string) {
+	bi.Index.Delete(filePath)
+}
+
+func (bi *BleveIndexer) FlushBatch(batch *bleve.Batch, batchSize, batchCount *int32) {
 	start := time.Now()
 	// println("-----> batchSize:", *batchSize/(1024*1024))
 	if batch.Size() > 0 {
@@ -133,26 +172,25 @@ func (bi *BleveIndexer) FlushBatch(batch *bleve.Batch, batchSize, batchCount *in
 
 // Tons of feature missing right now (highlighting , wildcard search , etc....)
 // Work on them later
-func (bi *BleveIndexer) Search(query string) ([]*models.Document, error) {
-	fmt.Println(query)
-	Query := bleve.NewQueryStringQuery(query)
-	SearchRequest := bleve.NewSearchRequest(Query)
-	SearchRequest.Fields = []string{"path", "size", "mod_time", "extension"}
-	SearchResult, err := bi.Index_m.Search(SearchRequest)
+func (bi *BleveIndexer) Search(req *bleve.SearchRequest) ([]models.Document, error) {
+	basepath, err := bi.Index.GetInternal([]byte("__base_path__"))
 	if err != nil {
-		return nil, fmt.Errorf("failed to search index: %w", err)
+		return nil, err
 	}
-	var results []*models.Document
+	basePath := string(basepath)
+	SearchResult, _ := bi.Index.Search(req)
+	var results []models.Document
 	for _, hit := range SearchResult.Hits {
-		fmt.Println(hit.ID)
-		doc := &models.Document{
-			Path:      hit.ID,
+		// fmt.Println(hit.ID)
+		doc := models.Document{
+			Path:      basePath + "/" + hit.ID,
+			Score:     hit.Score,
 			Size:      int64(hit.Fields["size"].(float64)),
 			ModTime:   hit.Fields["mod_time"].(string),
 			Extension: hit.Fields["extension"].(string),
 			// Content: hit.Fields["Content"].(string),
 		}
-		println(doc.Path, doc.Size, doc.Extension, doc.ModTime)
+		// println(doc.Path, doc.Size, doc.Extension, doc.ModTime)
 		results = append(results, doc)
 	}
 	return results, nil
@@ -160,14 +198,14 @@ func (bi *BleveIndexer) Search(query string) ([]*models.Document, error) {
 
 // Close the index and release the resources
 func (bi *BleveIndexer) Close() error {
-	if err := bi.Index_m.Close(); err != nil {
+	if err := bi.Index.Close(); err != nil {
 		return fmt.Errorf("failed to close index: %w", err)
 	}
 	return nil
 }
 
 // Update the statistics of the indexer
-func (bi *BleveIndexer) UpdateStats(currSize, currCount int) {
+func (bi *BleveIndexer) UpdateStats(currSize, currCount int32) {
 	bi.statsLock.Lock()
 	bi.stats.DocumentsIndexed += currCount
 	bi.stats.TotalSize += currSize

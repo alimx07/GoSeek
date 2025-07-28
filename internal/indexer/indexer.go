@@ -22,8 +22,8 @@ type Indexer interface {
 }
 
 type IndexStats struct {
-	TotalSize        int
-	DocumentsIndexed int
+	TotalSize        int32
+	DocumentsIndexed int32
 }
 
 func (stats IndexStats) String() string {
