@@ -1,7 +1,6 @@
 package watcher
 
 import (
-	"GoSeek/internal/indexer"
 	"fmt"
 	"time"
 
@@ -9,24 +8,17 @@ import (
 )
 
 type FileWatcher struct {
-	Watcher    *fsnotify.Watcher
-	Indexer    *indexer.BleveIndexer
-	deleteChan chan string
-	writeChan  chan string
-	createChan chan string
-	onDelete   func(string)
-	onWrite    func(string)
-	onCreate   func(string)
+	Watcher  *fsnotify.Watcher
+	onDelete func(string)
+	onWrite  func(string)
+	onCreate func(string)
 }
 
 func NewFileWatcher(onDelete func(string), OnWrite func(string), onCreate func(string)) *FileWatcher {
 	return &FileWatcher{
-		deleteChan: make(chan string, 4),
-		writeChan:  make(chan string, 4),
-		createChan: make(chan string, 4),
-		onDelete:   onDelete,
-		onWrite:    OnWrite,
-		onCreate:   onCreate,
+		onDelete: onDelete,
+		onWrite:  OnWrite,
+		onCreate: onCreate,
 	}
 }
 
