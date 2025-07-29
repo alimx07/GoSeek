@@ -3,6 +3,7 @@ package gui
 import (
 	"GoSeek/internal/models"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -16,14 +17,14 @@ import (
 
 // UI constants
 const (
-	DefaultWindowWidth  = 800
-	DefaultWindowHeight = 600
-	TableColumnWidth0   = 150  // File Name
-	TableColumnWidth1   = 80   // Score
+	DefaultWindowWidth  = 600
+	DefaultWindowHeight = 400
+	TableColumnWidth0   = 300  // File Name
+	TableColumnWidth1   = 100  // Score
 	TableColumnWidth2   = 100  // Size
-	TableColumnWidth3   = 80   // ext
-	TableColumnWidth4   = 300  // File Path
-	TableColumnWidth5   = 100  // ModTime
+	TableColumnWidth3   = 100  // ext
+	TableColumnWidth4   = 500  // File Path
+	TableColumnWidth5   = 200  // ModTime
 	LeftPanelOffset     = 0.25 // 25% for left panel
 	ResultsPreviewSplit = 0.5  // 50% for results, 50% for preview
 )
@@ -51,7 +52,7 @@ type treeContext struct {
 }
 
 func NewApp() *GUI {
-	app := app.New()
+	app := app.NewWithID("GoSeek")
 	app.SetIcon(theme.FolderIcon())
 
 	window := app.NewWindow("GoSeek - Document Search")
@@ -98,7 +99,6 @@ func (g *GUI) createMainMenu() *fyne.MainMenu {
 	return fyne.NewMainMenu(fileMenu, viewMenu, helpMenu)
 }
 
-// TODO : Fix content preview dynamic sizing issue
 func (g *GUI) setupUI() {
 
 	g.createFolderTree()
@@ -124,9 +124,11 @@ func (g *GUI) setupUI() {
 	)
 	g.setTableColumnWidths(headerRow)
 
-	resultsContainer := container.NewVBox(
+	resultsContainer := container.NewBorder(
 		widget.NewLabel("Search Results"),
-		headerRow,
+		nil,
+		nil,
+		nil,
 		g.resultsTable,
 	)
 
@@ -141,8 +143,11 @@ func (g *GUI) setupUI() {
 	)
 	mainContent.SetOffset(ResultsPreviewSplit)
 
-	centerPanel := container.NewVBox(
+	centerPanel := container.NewBorder(
 		searchContainer,
+		nil,
+		nil,
+		nil,
 		mainContent,
 	)
 
@@ -248,7 +253,6 @@ func (g *GUI) createSearchPanel() *fyne.Container {
 	})
 	searchButton.Importance = widget.HighImportance
 
-	// Clear button
 	clearButton := widget.NewButtonWithIcon("Clear", theme.ContentClearIcon(), func() {
 		g.clearSearch()
 	})
@@ -265,36 +269,44 @@ func (g *GUI) createSearchPanel() *fyne.Container {
 
 	return container.NewVBox(searchRow)
 }
-
+func truncateText(text string, maxLen int) string {
+	if len(text) > maxLen {
+		return text[:maxLen] + "..."
+	}
+	return text
+}
 func (g *GUI) createResultsTable() {
 	g.resultsTable = widget.NewTable(
 		func() (int, int) {
-			return len(g.searchResults), 6 // rows, columns
+			// Add one row for the header
+			return len(g.searchResults) + 1, 6 // rows, columns
 		},
 		func() fyne.CanvasObject {
-			return widget.NewLabel("Template")
+			return widget.NewLabel("")
 		},
 		func(id widget.TableCellID, cell fyne.CanvasObject) {
 			label := cell.(*widget.Label)
-			if id.Row >= len(g.searchResults) {
-				label.SetText("")
-				return
-			}
-
-			result := g.searchResults[id.Row]
-			switch id.Col {
-			case 0:
-				label.SetText(result.Path)
-			case 1:
-				label.SetText(fmt.Sprintf("%.2f", result.Score))
-			case 2:
-				label.SetText(fmt.Sprintf("%v", result.Size))
-			case 3:
-				label.SetText(result.Extension)
-			case 4:
-				label.SetText(result.Path)
-			case 5:
-				label.SetText(result.ModTime)
+			headers := []string{"File Name", "Score", "Size", "Ext", "File Path", "ModTime"}
+			if id.Row == 0 {
+				label.TextStyle.Bold = true
+				label.SetText(headers[id.Col])
+			} else {
+				label.TextStyle.Bold = false
+				result := g.searchResults[id.Row-1]
+				switch id.Col {
+				case 0:
+					label.SetText(truncateText(result.Path, 30))
+				case 1:
+					label.SetText(fmt.Sprintf("%.2f", result.Score))
+				case 2:
+					label.SetText(fmt.Sprintf("%v", result.Size))
+				case 3:
+					label.SetText(result.Extension)
+				case 4:
+					label.SetText(truncateText(result.Path, 80))
+				case 5:
+					label.SetText(result.ModTime)
+				}
 			}
 		},
 	)
@@ -302,8 +314,8 @@ func (g *GUI) createResultsTable() {
 	g.setTableColumnWidths(g.resultsTable)
 
 	g.resultsTable.OnSelected = func(id widget.TableCellID) {
-		if id.Row < len(g.searchResults) {
-			result := g.searchResults[id.Row]
+		if id.Row > 0 && id.Row-1 < len(g.searchResults) {
+			result := g.searchResults[id.Row-1]
 			g.loadPreview(result.Path)
 		}
 	}
@@ -340,7 +352,7 @@ func (tc *treeContext) findFolder(UID widget.TreeNodeID) *Folder {
 
 func (tc *treeContext) findFolderinTree(uid string) *Folder {
 
-	parts := strings.Split(uid, "/")
+	parts := strings.Split(uid, string(filepath.Separator))
 	currentFolder := tc.root
 
 	for _, part := range parts {
@@ -361,9 +373,6 @@ func (tc *treeContext) findFolderinTree(uid string) *Folder {
 	return currentFolder
 }
 
-// ALL Folder and Tree Operations
-// need revisting , testing and Refactor
-// Just work for now
 func (g *GUI) createFolderTree() {
 	if g.excludedFolders == nil {
 		g.excludedFolders = make(map[string]bool)
@@ -399,7 +408,7 @@ func (g *GUI) createFolderTree() {
 			if folder != nil && len(folder.Children) > 0 {
 				var ids []widget.TreeNodeID
 				for name := range folder.Children {
-					childID := widget.TreeNodeID(string(uid) + "/" + name)
+					childID := widget.TreeNodeID(string(uid) + string(filepath.Separator) + name)
 					ids = append(ids, childID)
 				}
 				return ids
@@ -456,12 +465,11 @@ func (g *GUI) createFolderTree() {
 				label.SetText(folder.Name)
 
 				// Create a path for the folder for exclusion tracking
+				// TODO : Modify if UID will be changed Or Remove if not
 				folderPath := g.getFolderPath(uid)
 
-				// Update checkbox state
 				check.SetChecked(!g.excludedFolders[folderPath])
 
-				// Handle user interaction
 				check.OnChanged = func(checked bool) {
 					if checked {
 						delete(g.excludedFolders, folderPath)
@@ -488,14 +496,11 @@ func (g *GUI) createFolderTree() {
 	}
 }
 
-// New helper function to find folder in the trie structure
-
 // Helper function to get the full path of a folder from UID
 func (g *GUI) getFolderPath(uid widget.TreeNodeID) string {
-	return string(uid) // For now, use the UID as the path
+	return string(uid) // For now, The UID as the path
 }
 
-// Update initializeFolderTree to work with the new trie structure
 func (g *GUI) initializeFolderTree() {
 	rootFolder := g.tree.root
 	if rootFolder == nil {
@@ -509,7 +514,7 @@ func (g *GUI) initializeFolderTree() {
 	for name := range rootFolder.Children {
 		node := widget.TreeNodeID(name)
 
-		fyne.DoAndWait(func() {
+		fyne.Do(func() {
 			g.folderTree.OpenBranch(node)
 		})
 	}
@@ -554,7 +559,7 @@ func (g *GUI) walkTree(currPath string, folder *Folder, callback func(string)) {
 		if childPath == "" {
 			childPath = name
 		} else {
-			childPath = currPath + "/" + name
+			childPath = currPath + string(filepath.Separator) + name
 		}
 		g.walkTree(childPath, child, callback)
 	}
@@ -568,8 +573,7 @@ func (g *GUI) performSearch() {
 	// sizeFilter := g.sizeFilter.Selected
 
 	g.previewText.ParseMarkdown("Searching...")
-
-	go func() {
+	fyne.Do(func() {
 		folders := g.getCheckedFolders()
 		results := SearchDocuments(query, folders)
 
@@ -579,14 +583,14 @@ func (g *GUI) performSearch() {
 		// }
 
 		g.updateSearchResults(results)
-	}()
+	})
 }
 
 func (g *GUI) loadPreview(filePath string) {
 
 	g.previewText.ParseMarkdown("Loading preview...")
 
-	go func() {
+	fyne.Do(func() {
 		preview, err := GetDocumentPreview(filePath)
 
 		if preview != "" {
@@ -594,7 +598,7 @@ func (g *GUI) loadPreview(filePath string) {
 		} else {
 			g.previewText.ParseMarkdown(err.Error())
 		}
-	}()
+	})
 }
 
 func (g *GUI) reindexFolder(path string) {

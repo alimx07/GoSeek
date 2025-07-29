@@ -19,8 +19,6 @@ type Folder struct {
 	Children map[string]*Folder
 }
 
-// var gCfg = config.LoadGlobalConfig()
-// var Cfg = config.Config{}
 var root = &Folder{
 	Name:     "",
 	Children: make(map[string]*Folder),
@@ -28,7 +26,7 @@ var root = &Folder{
 
 var FolderIndex = make(map[string]*coordinator.Coordinator)
 
-// CreateTree create prefix tree (trie) from all paths in index
+// CreateTree creates prefix tree (trie) from all paths in index
 func CreateTreeFromIndex(root *Folder, prePath string, res *bleve.SearchResult, c *coordinator.Coordinator) *Folder {
 	if root == nil || res == nil {
 		return root
@@ -42,9 +40,8 @@ func CreateTreeFromIndex(root *Folder, prePath string, res *bleve.SearchResult, 
 		if dir == "." {
 			continue
 		}
-		// println("OUT: ", dir)
-		if _, ok := vis[dir]; !ok {
-			c.UpdateChan <- prePath + "/" + dir
+		if _, ok := vis[dir]; !ok { // prevent duplicates
+			c.UpdateChan <- prePath + string(filepath.Separator) + dir
 			vis[dir] = true
 			insertToTree(root, dir)
 		}
@@ -71,7 +68,7 @@ func GetPaths(index *indexer.BleveIndexer) *bleve.SearchResult {
 	return searchResults
 }
 
-// Get All prevIndexes at the fly when app reopen
+// Get All prevIndexes on the fly when app reopen
 func GetIndexes() *Folder {
 	data, err := config.ReadFromFile()
 	if err != nil {
@@ -99,16 +96,12 @@ func GetIndexes() *Folder {
 	return root
 }
 
-// TODO:
-// more dynamic way for handling paths
-// Fix: Add paths inside index according to OS seperator
 func insertToTree(root *Folder, path string) {
 	if path == "" {
 		return
 	}
 	// println(path)
-	// Use proper path separator for Windows
-	parts := strings.Split(path, "\\")
+	parts := strings.Split(path, string(filepath.Separator))
 	node := root
 
 	for _, part := range parts {
@@ -128,34 +121,30 @@ func insertToTree(root *Folder, path string) {
 	}
 }
 
-// Search in indexes
+// Search in all indexes found with specific query
 func SearchDocuments(queryString string, folders []string) []models.Document {
 	var results []models.Document
 	indexGroups := groupFolders(folders)
-	// println(queryString, " ", len(indexGroups))
 	for coord, dirs := range indexGroups {
-		// println(dirs, coord)
 		query := CreateQuery(queryString, dirs)
 		searchRequest := bleve.NewSearchRequest(query)
 		searchRequest.Size = 1000 // Limit results count for now (rare to be more than that) handle later
 		searchRequest.Fields = []string{"path", "score", "size", "mod_time", "extension"}
 		res, err := coord.Indexer.Search(searchRequest)
-		// println(len(res))
 		if err != nil {
 			println(err)
 		}
 		results = append(results, res...)
 	}
+	// for _, res := range results {
+	// 	println(res.Dir)
+	// }
 	return results
 }
 
 // Group Folders according to coord (Index)
 func groupFolders(folders []string) map[*coordinator.Coordinator][]string {
 	groups := make(map[*coordinator.Coordinator][]string)
-	// println(folders)
-	// for coord, folder := range FolderIndex {
-	// 	println(coord, " ", folder)
-	// }
 	for _, folder := range folders {
 		for parentFolder, coord := range FolderIndex {
 			// println(parentFolder, " ", folder, " ", coord)
@@ -167,7 +156,7 @@ func groupFolders(folders []string) map[*coordinator.Coordinator][]string {
 	return groups
 }
 
-// Create Query --> search in these dirs and get files with queryString word
+// Create Query --> search in files only that are in these dirs and has queryString word
 func CreateQuery(queryString string, dirs []string) *query.ConjunctionQuery {
 	queries := make([]query.Query, 0, len(dirs))
 	for _, dir := range dirs {
@@ -175,10 +164,10 @@ func CreateQuery(queryString string, dirs []string) *query.ConjunctionQuery {
 		q.SetField("dir")
 		queries = append(queries, q)
 	}
-	dirQuery := bleve.NewDisjunctionQuery(queries...)
+	dirQuery := bleve.NewDisjunctionQuery(queries...) // In any of these dirs (Group of OR)
 	keywordQuery := bleve.NewMatchQuery(queryString)
 	keywordQuery.SetField("content")
-	finalQuery := bleve.NewConjunctionQuery(dirQuery, keywordQuery)
+	finalQuery := bleve.NewConjunctionQuery(dirQuery, keywordQuery) // dirQuery And Contains this keyword
 
 	return finalQuery
 }
@@ -233,7 +222,8 @@ func GetDocumentPreview(path string) (string, error) {
 	}
 	defer file.Close()
 	// TODO:
-	// Add Streaming the content according to page num in preview
+	// Add Streaming for the content according to page num in preview
+	// Error Now : when the file is to large
 	buf := make([]byte, 256*1024) // Just read files for now
 	n, err := file.Read(buf)
 	if err != nil {
