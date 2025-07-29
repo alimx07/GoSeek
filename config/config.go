@@ -2,34 +2,13 @@ package config
 
 import (
 	"os"
-	"path/filepath"
-
-	"gopkg.in/yaml.v3"
 )
 
 type GlobalConfig struct {
 	ChunkSize             int
 	NumWorkers            int
-	IndexBatchMemoryLimit int
+	IndexBatchMemoryLimit int32
 	ChannelBufferSize     int
-}
-
-type IndexConfig struct {
-	Name               string          `yaml:"name"`
-	Folders            []string        `yaml:"folders"`
-	IndexPath          string          `yaml:"index_path"`
-	PendingChangesPath string          `yaml:"pending_changes_path"`
-	Extensions         map[string]bool `yaml:"extensions"`
-}
-
-type Config struct {
-	Indexes []*IndexConfig `yaml:"indexes"`
-	// TODO:
-	// Problem : Think of user write to file with auto save (multiple write events for every change)
-	// Add mechanism to wait some time (Delay)
-	// handle only last event
-	// DebounceDelayMs int           `yaml:"debounce_delay_ms"`
-	LogDir string `yaml:"log_dir"`
 }
 
 // Global configs of the app
@@ -42,42 +21,27 @@ func LoadGlobalConfig() *GlobalConfig {
 	}
 }
 
-// Configs that contains the metadata about index
-func NewIndexConfig(path string) (*IndexConfig, error) {
-	Name := filepath.Base(path)
-	return &IndexConfig{
-		Name:      path,
-		IndexPath: "../index/" + Name,
-		Extensions: map[string]bool{
-			".txt":  true,
-			".md":   true,
-			".json": true,
-			".log":  true,
-			".go":   true,
-			".py":   true,
-			".java": true,
-		},
-		PendingChangesPath: "../pending_changes/" + Name + ".txt",
-	}, nil
+// use txt file as the presistent memory for now
+func SaveToFile(filePath string) error {
+	data := []byte(filePath + "\n")
+	if _, err := os.Stat("indexes.txt"); os.IsNotExist(err) {
+		return os.WriteFile("indexes.txt", data, 0644)
+	}
+
+	file, err := os.OpenFile("indexes.txt", os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	_, err = file.Write(data)
+	return err
 }
 
-func SaveConfigToYAML(config *Config, filePath string) error {
-	data, err := yaml.Marshal(config)
+func ReadFromFile() (string, error) {
+	data, err := os.ReadFile("indexes.txt")
 	if err != nil {
-		return err
+		return "", err
 	}
-
-	return os.WriteFile(filePath, data, 0644)
-}
-
-func ReadYAMLToConfig(config *Config, filePath string) error {
-	file, err := os.ReadFile(filePath)
-	if err != nil {
-		return err
-	}
-	err = yaml.Unmarshal(file, config)
-	if err != nil {
-		return err
-	}
-	return nil
+	return string(data), nil
 }
