@@ -5,11 +5,16 @@ import (
 	"GoSeek/internal/coordinator"
 	"GoSeek/internal/indexer"
 	"GoSeek/internal/models"
+	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
 	"github.com/blevesearch/bleve/v2"
 	"github.com/blevesearch/bleve/v2/search/query"
 )
@@ -122,24 +127,25 @@ func insertToTree(root *Folder, path string) {
 }
 
 // Search in all indexes found with specific query
-func SearchDocuments(queryString string, folders []string) []models.Document {
+func SearchDocuments(queryString *query.QueryStringQuery, folders []string) ([]models.Document, error) {
 	var results []models.Document
 	indexGroups := groupFolders(folders)
 	for coord, dirs := range indexGroups {
-		query := CreateQuery(queryString, dirs)
+		dirQuery := CreateDirQuery(dirs)
+		query := bleve.NewConjunctionQuery(queryString, dirQuery)
 		searchRequest := bleve.NewSearchRequest(query)
 		searchRequest.Size = 1000 // Limit results count for now (rare to be more than that) handle later
 		searchRequest.Fields = []string{"path", "score", "size", "mod_time", "extension"}
 		res, err := coord.Indexer.Search(searchRequest)
 		if err != nil {
-			println(err)
+			return nil, err
 		}
 		results = append(results, res...)
 	}
 	// for _, res := range results {
 	// 	println(res.Dir)
 	// }
-	return results
+	return results, nil
 }
 
 // Group Folders according to coord (Index)
@@ -156,21 +162,84 @@ func groupFolders(folders []string) map[*coordinator.Coordinator][]string {
 	return groups
 }
 
-// Create Query --> search in files only that are in these dirs and has queryString word
-func CreateQuery(queryString string, dirs []string) *query.ConjunctionQuery {
+func CreateDirQuery(dirs []string) *query.DisjunctionQuery {
 	queries := make([]query.Query, 0, len(dirs))
 	for _, dir := range dirs {
 		q := bleve.NewTermQuery(dir)
 		q.SetField("dir")
 		queries = append(queries, q)
 	}
-	dirQuery := bleve.NewDisjunctionQuery(queries...) // In any of these dirs (Group of OR)
-	keywordQuery := bleve.NewMatchQuery(queryString)
-	keywordQuery.SetField("content")
-	finalQuery := bleve.NewConjunctionQuery(dirQuery, keywordQuery) // dirQuery And Contains this keyword
-
-	return finalQuery
+	dirQuery := bleve.NewDisjunctionQuery(queries...)
+	return dirQuery
 }
+
+func CreateStringQuery(queryString string) (*query.QueryStringQuery, error) {
+	StringQuery := bleve.NewQueryStringQuery(queryString)
+	// println(keywordQuery.Query)
+	err := StringQuery.Validate()
+	if err != nil {
+		return nil, err
+	}
+	return StringQuery, nil
+}
+
+func GetSearchTerms(queryString *query.QueryStringQuery) []string {
+	parseQuery, _ := queryString.Parse()
+	searchTerms := walkQuery(parseQuery)
+	return searchTerms
+}
+func walkQuery(q query.Query) []string {
+	switch t := q.(type) {
+	case *query.TermQuery:
+		// println("T-->", t.Term)
+		return []string{t.Term}
+	case *query.MatchQuery:
+		// println("M-->", t.Match)
+		return []string{t.Match}
+	case *query.BooleanQuery:
+		var out []string
+		if t.Must != nil {
+			if mustSlice, ok := (t.Must).(*query.ConjunctionQuery); ok {
+				for _, must := range mustSlice.Conjuncts {
+					out = append(out, walkQuery(must)...)
+				}
+			}
+		}
+		if t.Should != nil {
+			if shouldSlice, ok := (t.Should).(*query.DisjunctionQuery); ok {
+				for _, should := range shouldSlice.Disjuncts {
+					// println("S")
+					out = append(out, walkQuery(should)...)
+				}
+			}
+			if t.MustNot != nil {
+				if mustNotSlice, ok := (t.MustNot).(*query.DisjunctionQuery); ok {
+					for _, mustNot := range mustNotSlice.Disjuncts {
+						out = append(out, walkQuery(mustNot)...)
+					}
+				}
+			}
+		}
+		return out
+	case *query.ConjunctionQuery:
+		var out []string
+		for _, sub := range t.Conjuncts {
+			out = append(out, walkQuery(sub)...)
+		}
+		return out
+	case *query.DisjunctionQuery:
+		var out []string
+		for _, sub := range t.Disjuncts {
+			out = append(out, walkQuery(sub)...)
+		}
+		return out
+	case *query.RegexpQuery:
+		// println("R--->", t.Regexp)
+		return []string{"/" + t.Regexp + "/"}
+	}
+	return nil
+}
+
 
 // Create New index
 func IndexFolder(path string) (*treeContext, error) {
@@ -214,20 +283,86 @@ func RemoveFolder(path string) (*treeContext, error) {
 	return nil, nil
 }
 
-// Open File in Content Preview section
-func GetDocumentPreview(path string) (string, error) {
+func BuildRegexPattern(terms []string) (*regexp.Regexp, error) {
+	patterns := []string{}
+	for _, term := range terms {
+		if isRegexInput(term) {
+			patterns = append(patterns, `(?i)`+term[1:len(term)-1]+`\b`)
+		} else {
+			escaped := regexp.QuoteMeta(term)
+			patterns = append(patterns, `(?i)\b`+escaped+`\b`)
+		}
+	}
+
+	fullPattern := strings.Join(patterns, "|")
+	re, err := regexp.Compile(fullPattern)
+	if err != nil {
+		return nil, err
+	}
+	return re, nil
+}
+
+// Open File in Content Preview section with
+func GetDocumentPreview(path string, re *regexp.Regexp, updatafn func([]widget.RichTextSegment)) error {
 	file, err := os.Open(path)
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer file.Close()
-	// TODO:
-	// Add Streaming for the content according to page num in preview
-	// Error Now : when the file is to large
-	buf := make([]byte, 256*1024) // Just read files for now
-	n, err := file.Read(buf)
-	if err != nil {
-		return "", err
+	reader := bufio.NewReader(file)
+	segments := []widget.RichTextSegment{}
+	linecount := 0
+	for {
+		line, err := reader.ReadString('\n')
+		if len(line) > 0 {
+			lastIndex := 0
+			locs := re.FindAllStringIndex(line, -1)
+			for _, loc := range locs {
+				start, end := loc[0], loc[1]
+				// println(start, "  ", end)
+				if start > lastIndex {
+					seg := &widget.TextSegment{
+						Text: line[lastIndex:start],
+					}
+					// seg.Style.Alignment = true
+					seg.Style.Inline = true
+					segments = append(segments, seg)
+				}
+
+				match := &widget.TextSegment{
+					Text:  line[start:end] + " ",
+					Style: widget.RichTextStyleBlockquote,
+				}
+
+				match.Style.Inline = true
+				match.Style.ColorName = theme.ColorNameWarning
+				segments = append(segments, match)
+				lastIndex = end
+			}
+
+			if lastIndex < len(line) {
+				segments = append(segments, &widget.TextSegment{
+					Text: line[lastIndex:],
+				})
+			}
+
+		}
+		linecount++
+		if linecount%200 == 0 {
+			updatafn(segments)
+			segments = []widget.RichTextSegment{}
+		}
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil
+		}
 	}
-	return string(buf[:n]), nil
+	updatafn(segments)
+	return nil
+}
+
+func isRegexInput(input string) bool {
+	return len(input) >= 2 && input[0] == '/' && input[len(input)-1] == '/'
 }

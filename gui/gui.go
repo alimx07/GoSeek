@@ -42,6 +42,7 @@ type GUI struct {
 	folderTree      *widget.Tree
 	tree            *treeContext
 	searchResults   []models.Document
+	searchTerms     []string
 	excludedFolders map[string]bool
 	isDarkTheme     bool
 }
@@ -103,7 +104,7 @@ func (g *GUI) setupUI() {
 
 	g.createFolderTree()
 	g.createResultsTable()
-	g.createPreviewPanel()
+	previewContainer := g.createPreviewPanel()
 	searchContainer := g.createSearchPanel()
 
 	headerRow := widget.NewTable(
@@ -130,11 +131,6 @@ func (g *GUI) setupUI() {
 		nil,
 		nil,
 		g.resultsTable,
-	)
-
-	previewContainer := container.NewVBox(
-		widget.NewLabel("Document Preview"),
-		g.previewText,
 	)
 
 	mainContent := container.NewVSplit(
@@ -196,6 +192,7 @@ func (g *GUI) showFolderSelectionDialog(onSelected func(path string)) {
 		}
 		onSelected(uri.Path())
 	}, g.window)
+
 }
 
 func (g *GUI) handleFolderOperation(operation func() (*treeContext, error), successMessage string) {
@@ -226,6 +223,7 @@ func (g *GUI) clearSearch() {
 	g.searchEntry.SetText("")
 	g.searchResults = []models.Document{}
 	g.resultsTable.Refresh()
+	g.searchTerms = []string{}
 	g.previewText.ParseMarkdown("Select a search result to view preview...")
 }
 
@@ -321,12 +319,25 @@ func (g *GUI) createResultsTable() {
 	}
 }
 
-func (g *GUI) createPreviewPanel() {
+func (g *GUI) createPreviewPanel() *fyne.Container {
 	g.previewText = widget.NewRichText()
 	g.previewText.ParseMarkdown("Select a search result to view preview...")
 	g.previewText.Wrapping = fyne.TextWrapWord
-}
 
+	scrollPerview := container.NewVScroll(g.previewText)
+	//TODO:
+	// Add Buttons to jump between found terms in document
+	// controls := container.NewHBox(itemNum, totalItems, prevBtn, nextBtn)
+
+	previewPanel := container.NewBorder(
+		nil,
+		nil,
+		nil,
+		nil,
+		scrollPerview,
+	)
+	return previewPanel
+}
 func (g *GUI) initTreeContext() {
 	root := GetIndexes()
 	g.tree = &treeContext{
@@ -575,8 +586,17 @@ func (g *GUI) performSearch() {
 	g.previewText.ParseMarkdown("Searching...")
 	fyne.Do(func() {
 		folders := g.getCheckedFolders()
-		results := SearchDocuments(query, folders)
-
+		stringQuery, err := CreateStringQuery(query)
+		if err != nil {
+			print(err)
+			return
+		}
+		g.searchTerms = GetSearchTerms(stringQuery)
+		results, err := SearchDocuments(stringQuery, folders)
+		if err != nil {
+			print(err)
+			return
+		}
 		// if sizeFilter != "Any Size" {
 		// 	fmt.Printf("Applying size filter: %s\n", sizeFilter)
 
@@ -588,16 +608,21 @@ func (g *GUI) performSearch() {
 
 func (g *GUI) loadPreview(filePath string) {
 
-	g.previewText.ParseMarkdown("Loading preview...")
-
+	// g.previewText.ParseMarkdown("Loading preview...")
+	g.previewText.Segments = []widget.RichTextSegment{}
+	updatafn := func(seg []widget.RichTextSegment) {
+		fyne.Do(func() {
+			g.previewText.Segments = append(g.previewText.Segments, seg...)
+			g.previewText.Refresh()
+		})
+	}
 	fyne.Do(func() {
-		preview, err := GetDocumentPreview(filePath)
-
-		if preview != "" {
-			g.previewText.ParseMarkdown(preview)
-		} else {
-			g.previewText.ParseMarkdown(err.Error())
+		re, err := BuildRegexPattern(g.searchTerms)
+		if err != nil {
+			print(err.Error())
+			return
 		}
+		GetDocumentPreview(filePath, re, updatafn)
 	})
 }
 
