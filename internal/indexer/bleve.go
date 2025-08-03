@@ -46,29 +46,29 @@ func NewBleveIndexer(folderPath string, extensions map[string]bool) (*BleveIndex
 	contentField := bleve.NewTextFieldMapping()
 	contentField.Index = true
 	contentField.Store = false
-	contentField.IncludeTermVectors = false // Enable it for highlighting words feature
+	contentField.IncludeTermVectors = false
 
 	dirFiled := bleve.NewTextFieldMapping()
 	dirFiled.Index = true
-	dirFiled.Store = true // Store the path so we can retrieve it
+	dirFiled.Store = false
 	dirFiled.IncludeTermVectors = false
 	dirFiled.IncludeInAll = false
 	dirFiled.Analyzer = "keyword"
 
 	sizeField := bleve.NewNumericFieldMapping()
-	sizeField.Index = false
+	sizeField.Index = true
 	sizeField.Store = true
 	sizeField.IncludeTermVectors = false
 	sizeField.IncludeInAll = false
 
-	modTimeField := bleve.NewTextFieldMapping()
-	modTimeField.Index = false
+	modTimeField := bleve.NewDateTimeFieldMapping()
+	modTimeField.Index = true
 	modTimeField.Store = true
 	modTimeField.IncludeTermVectors = false
 	modTimeField.IncludeInAll = false
 
 	extensionField := bleve.NewTextFieldMapping()
-	extensionField.Index = false
+	extensionField.Index = true
 	extensionField.Store = true
 	extensionField.IncludeTermVectors = false
 	extensionField.IncludeInAll = false
@@ -81,13 +81,6 @@ func NewBleveIndexer(folderPath string, extensions map[string]bool) (*BleveIndex
 	documentMapping.AddFieldMappingsAt("extension", extensionField)
 
 	indexMapping.DefaultMapping = documentMapping
-
-	// scorchConfig := map[string]interface{}{
-	// 	"unsafe_batches":     true, // Enable unsafe mode
-	// 	"numSnapshotsToKeep": 1,    // Keep minimal snapshots
-	// 	// "mem_quota": 67108864, // 64MB memory quota
-	// 	// "forceMergeDeletesPctThreshold": 10.0,
-	// }
 
 	index, err := bleve.NewUsing(indexpath, indexMapping, bleve.Config.DefaultIndexType, "scorch", nil)
 	if err != nil {
@@ -168,28 +161,37 @@ func (bi *BleveIndexer) FlushBatch(batch *bleve.Batch, batchSize, batchCount *in
 
 // Search return the results found in index according to the query
 
-// TODO:
-
-// Tons of feature missing right now (highlighting , wildcard search , etc....)
-// Work on them later
 func (bi *BleveIndexer) Search(req *bleve.SearchRequest) ([]models.Document, error) {
 	basepath, err := bi.Index.GetInternal([]byte("__base_path__"))
 	if err != nil {
 		return nil, err
 	}
 	basePath := string(basepath)
-	SearchResult, _ := bi.Index.Search(req)
+	SearchResult, err := bi.Index.Search(req)
+	if SearchResult == nil {
+		println(err.Error())
+		return nil, nil
+	}
 	var results []models.Document
 	for _, hit := range SearchResult.Hits {
+		if hit.Fields == nil {
+			return nil, nil
+		}
 		// fmt.Println(hit.ID)
 		doc := models.Document{
-			Path:      basePath + "/" + hit.ID,
+			Path:      basePath + string(filepath.Separator) + hit.ID,
 			Score:     hit.Score,
 			Size:      int64(hit.Fields["size"].(float64)),
 			ModTime:   hit.Fields["mod_time"].(string),
 			Extension: hit.Fields["extension"].(string),
+			// Dir:       hit.Fields["dir"].(string),
 			// Content: hit.Fields["Content"].(string),
 		}
+		// if snippets, ok := hit.Fragments["content"]; ok {
+		// 	for _, snippet := range snippets {
+		// 		fmt.Println("Snippet:", snippet)
+		// 	}
+		// }
 		// println(doc.Path, doc.Size, doc.Extension, doc.ModTime)
 		results = append(results, doc)
 	}
