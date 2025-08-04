@@ -7,13 +7,12 @@ import (
 	"GoSeek/internal/models"
 	"bufio"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 
-	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/widget"
 	"github.com/blevesearch/bleve/v2"
 	"github.com/blevesearch/bleve/v2/search/query"
@@ -240,7 +239,6 @@ func walkQuery(q query.Query) []string {
 	return nil
 }
 
-
 // Create New index
 func IndexFolder(path string) (*treeContext, error) {
 	config.SaveToFile(path)
@@ -284,6 +282,9 @@ func RemoveFolder(path string) (*treeContext, error) {
 }
 
 func BuildRegexPattern(terms []string) (*regexp.Regexp, error) {
+	if len(terms) == 0 {
+		return nil, nil
+	}
 	patterns := []string{}
 	for _, term := range terms {
 		if isRegexInput(term) {
@@ -303,64 +304,60 @@ func BuildRegexPattern(terms []string) (*regexp.Regexp, error) {
 }
 
 // Open File in Content Preview section with
-func GetDocumentPreview(path string, re *regexp.Regexp, updatafn func([]widget.RichTextSegment)) error {
+func GetDocumentPreview(path string, re *regexp.Regexp, updateChan chan []widget.RichTextSegment) (map[int]location, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer file.Close()
-	reader := bufio.NewReader(file)
-	segments := []widget.RichTextSegment{}
+	defer close(updateChan)
+	scanner := bufio.NewScanner(file)
+	locations := make(map[int]location)
 	linecount := 0
-	for {
-		line, err := reader.ReadString('\n')
+	matchCount := 0
+	for scanner.Scan() {
+		line := scanner.Text()
 		if len(line) > 0 {
 			lastIndex := 0
-			locs := re.FindAllStringIndex(line, -1)
-			for _, loc := range locs {
-				start, end := loc[0], loc[1]
-				// println(start, "  ", end)
-				if start > lastIndex {
-					seg := &widget.TextSegment{
-						Text: line[lastIndex:start],
+			segments := []widget.RichTextSegment{}
+			if re != nil {
+				locs := re.FindAllStringIndex(line, -1)
+				for _, loc := range locs {
+					start, end := loc[0], loc[1]
+					if start > lastIndex {
+						segments = append(segments, &widget.TextSegment{
+							Text:  line[lastIndex:start],
+							Style: widget.RichTextStyle{Inline: true},
+						})
 					}
-					// seg.Style.Alignment = true
-					seg.Style.Inline = true
-					segments = append(segments, seg)
+					segments = append(segments, &widget.TextSegment{
+						Text: line[start:end],
+						Style: widget.RichTextStyle{
+							Inline:    true,
+							ColorName: fyne.ThemeColorName("warning"),
+							TextStyle: fyne.TextStyle{Bold: true},
+						},
+					})
+					locations[matchCount] = location{
+						rowId: linecount,
+						start: start,
+						end:   end,
+						segId: len(segments) - 1}
+					matchCount++
+					lastIndex = end
 				}
-
-				match := &widget.TextSegment{
-					Text:  line[start:end] + " ",
-					Style: widget.RichTextStyleBlockquote,
-				}
-
-				match.Style.Inline = true
-				match.Style.ColorName = theme.ColorNameWarning
-				segments = append(segments, match)
-				lastIndex = end
 			}
 
-			if lastIndex < len(line) {
+			if lastIndex <= len(line) {
 				segments = append(segments, &widget.TextSegment{
 					Text: line[lastIndex:],
 				})
 			}
-
-		}
-		linecount++
-		if linecount%200 == 0 {
-			updatafn(segments)
-			segments = []widget.RichTextSegment{}
-		}
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil
+			updateChan <- segments
+			linecount++
 		}
 	}
-	updatafn(segments)
-	return nil
+	return locations, nil
 }
 
 func isRegexInput(input string) bool {

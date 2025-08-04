@@ -4,7 +4,9 @@ import (
 	"GoSeek/internal/models"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -30,26 +32,41 @@ const (
 )
 
 // Folder
+type location struct {
+	rowId int
+	start int
+	end   int
+	segId int
+}
+type previewPanel struct {
+	navBar *fyne.Container
+	// previewContainer *container.Scroll
+	previewList *widget.List
+	lines       [][]widget.RichTextSegment // Each line contains segments
+}
+
+type treeContext struct {
+	root      *Folder
+	treeCache map[string]*Folder // cache UID --> Folder
+}
 
 // GUI Application
 type GUI struct {
 	app             fyne.App
 	window          fyne.Window
 	searchEntry     *widget.Entry
-	sizeFilter      *widget.Select
 	resultsTable    *widget.Table
-	previewText     *widget.RichText
+	previewPanel    *previewPanel
 	folderTree      *widget.Tree
 	tree            *treeContext
 	searchResults   []models.Document
 	searchTerms     []string
 	excludedFolders map[string]bool
 	isDarkTheme     bool
-}
-
-type treeContext struct {
-	root      *Folder
-	treeCache map[string]*Folder // cache UID --> Folder
+	locations       map[int]location
+	currentMatch    int
+	matchLabel      *widget.Label
+	matchEntry      *widget.Entry
 }
 
 func NewApp() *GUI {
@@ -104,7 +121,7 @@ func (g *GUI) setupUI() {
 
 	g.createFolderTree()
 	g.createResultsTable()
-	previewContainer := g.createPreviewPanel()
+	previewPanel := g.createPreviewPanel()
 	searchContainer := g.createSearchPanel()
 
 	headerRow := widget.NewTable(
@@ -135,7 +152,7 @@ func (g *GUI) setupUI() {
 
 	mainContent := container.NewVSplit(
 		resultsContainer,
-		previewContainer,
+		previewPanel,
 	)
 	mainContent.SetOffset(ResultsPreviewSplit)
 
@@ -168,6 +185,7 @@ func (g *GUI) setupUI() {
 	g.window.SetContent(mainSplit)
 
 	g.initializeFolderTree()
+
 }
 
 func (g *GUI) updateSearchResults(results []models.Document) {
@@ -175,9 +193,10 @@ func (g *GUI) updateSearchResults(results []models.Document) {
 	g.resultsTable.Refresh()
 
 	if len(results) == 0 {
-		g.previewText.ParseMarkdown("No results found.")
-	} else {
-		g.previewText.ParseMarkdown(fmt.Sprintf("Found %d results. Select a result to view preview.", len(results)))
+		g.previewPanel.lines = [][]widget.RichTextSegment{
+			{&widget.TextSegment{Text: "No Results Found"}},
+		}
+		// g.previewPanel.previewList.Refresh()
 	}
 }
 
@@ -224,7 +243,10 @@ func (g *GUI) clearSearch() {
 	g.searchResults = []models.Document{}
 	g.resultsTable.Refresh()
 	g.searchTerms = []string{}
-	g.previewText.ParseMarkdown("Select a search result to view preview...")
+
+	g.previewPanel.lines = [][]widget.RichTextSegment{
+		{&widget.TextSegment{Text: "Select a search result to view preview..."}},
+	}
 }
 
 func (g *GUI) createSearchPanel() *fyne.Container {
@@ -235,16 +257,6 @@ func (g *GUI) createSearchPanel() *fyne.Container {
 	g.searchEntry.OnSubmitted = func(query string) {
 		g.performSearch()
 	}
-
-	// TODO : Entry Range will be better (Min - Max) unit
-	g.sizeFilter = widget.NewSelect(
-		[]string{"Any Size", "< 1MB", "< 10MB", "< 100MB", "> 100MB"},
-		func(value string) {
-			// Handle size filter change
-			fmt.Printf("Size filter changed to: %s\n", value)
-		},
-	)
-	g.sizeFilter.SetSelected("Any Size")
 
 	searchButton := widget.NewButtonWithIcon("Search", theme.SearchIcon(), func() {
 		g.performSearch()
@@ -257,8 +269,6 @@ func (g *GUI) createSearchPanel() *fyne.Container {
 
 	searchRow := container.NewBorder(nil, nil, nil,
 		container.NewHBox(
-			widget.NewLabel("Size:"),
-			g.sizeFilter,
 			searchButton,
 			clearButton,
 		),
@@ -293,7 +303,7 @@ func (g *GUI) createResultsTable() {
 				result := g.searchResults[id.Row-1]
 				switch id.Col {
 				case 0:
-					label.SetText(truncateText(result.Path, 30))
+					label.SetText(truncateText(filepath.Base(result.Path), 30))
 				case 1:
 					label.SetText(fmt.Sprintf("%.2f", result.Score))
 				case 2:
@@ -320,23 +330,95 @@ func (g *GUI) createResultsTable() {
 }
 
 func (g *GUI) createPreviewPanel() *fyne.Container {
-	g.previewText = widget.NewRichText()
-	g.previewText.ParseMarkdown("Select a search result to view preview...")
-	g.previewText.Wrapping = fyne.TextWrapWord
+	g.previewPanel = &previewPanel{}
 
-	scrollPerview := container.NewVScroll(g.previewText)
-	//TODO:
-	// Add Buttons to jump between found terms in document
-	// controls := container.NewHBox(itemNum, totalItems, prevBtn, nextBtn)
-
-	previewPanel := container.NewBorder(
-		nil,
-		nil,
-		nil,
-		nil,
-		scrollPerview,
+	g.previewPanel.previewList = widget.NewList(
+		func() int {
+			return len(g.previewPanel.lines)
+		},
+		func() fyne.CanvasObject {
+			richText := widget.NewRichText()
+			richText.Wrapping = fyne.TextWrapWord
+			return richText
+		},
+		func(id widget.ListItemID, obj fyne.CanvasObject) {
+			richText := obj.(*widget.RichText)
+			// println(id)
+			if id < len(g.previewPanel.lines) {
+				richText.Segments = g.previewPanel.lines[id]
+				richText.Refresh()
+				g.previewPanel.previewList.SetItemHeight(id, float32(richText.MinSize().Height))
+			}
+		},
 	)
-	return previewPanel
+	g.previewPanel.previewList.OnSelected = func(id widget.ListItemID) {
+		if id < len(g.previewPanel.lines) {
+			println(id)
+			var lineText string
+			for _, seg := range g.previewPanel.lines[id] {
+				if text, ok := seg.(*widget.TextSegment); ok {
+					lineText += text.Text
+				}
+			}
+			clip := fyne.CurrentApp().Clipboard()
+			fyne.Do(func() {
+				clip.SetContent(lineText)
+			})
+		}
+	}
+	g.previewPanel.previewList.HideSeparators = true
+	g.previewPanel.lines = [][]widget.RichTextSegment{
+		{&widget.TextSegment{Text: "Select a search result to view preview..."}},
+	}
+	// g.previewPanel.previewContainer = container.NewVScroll(g.previewPanel.previewList)
+	prevBtn := widget.NewButton("Prev", func() {
+		g.gotoMatch(g.currentMatch - 1)
+	})
+	nextBtn := widget.NewButton("Next", func() {
+		g.gotoMatch(g.currentMatch + 1)
+	})
+	g.matchEntry = widget.NewEntry()
+	g.matchEntry.SetText("1")
+	g.matchEntry.SetPlaceHolder("")
+	// g.matchEntry.
+	g.matchEntry.OnSubmitted = func(val string) {
+		if n, err := strconv.Atoi(val); err == nil {
+			g.gotoMatch(n - 1)
+		}
+	}
+	g.matchLabel = widget.NewLabel("")
+	matchCont := container.NewPadded(g.matchEntry, g.matchLabel)
+	// matchCont.Resize(fyne.NewSize(30, 60))
+	g.previewPanel.navBar = container.NewHBox(matchCont, prevBtn, nextBtn)
+	g.previewPanel.navBar.Hide()
+	return container.NewBorder(
+		g.previewPanel.navBar,
+		nil,
+		nil,
+		nil,
+		g.previewPanel.previewList)
+}
+
+// g.refreshPreviewContent()
+func (g *GUI) gotoMatch(idx int) {
+	if g.locations == nil {
+		return
+	}
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(g.locations) {
+		idx = len(g.locations) - 1
+	}
+	g.currentMatch = idx
+	loc := g.locations[idx]
+	g.matchEntry.SetText(strconv.Itoa(idx + 1))
+	g.matchLabel.SetText("  / " + strconv.Itoa(len(g.locations)))
+	// if seg, ok := g.previewPanel.lines[loc.rowId][loc.segId].(*widget.TextSegment); ok {
+	// 	seg.Style.TextStyle = fyne.TextStyle{Bold: true}
+	// 	seg.Style.ColorName = fyne.ThemeColorName("warning")
+	// }
+	g.previewPanel.previewList.ScrollTo(loc.rowId)
 }
 func (g *GUI) initTreeContext() {
 	root := GetIndexes()
@@ -583,7 +665,7 @@ func (g *GUI) performSearch() {
 
 	// sizeFilter := g.sizeFilter.Selected
 
-	g.previewText.ParseMarkdown("Searching...")
+	// g.previewPanel.previewText.ParseMarkdown("Searching...")
 	fyne.Do(func() {
 		folders := g.getCheckedFolders()
 		stringQuery, err := CreateStringQuery(query)
@@ -605,24 +687,40 @@ func (g *GUI) performSearch() {
 		g.updateSearchResults(results)
 	})
 }
-
 func (g *GUI) loadPreview(filePath string) {
 
-	// g.previewText.ParseMarkdown("Loading preview...")
-	g.previewText.Segments = []widget.RichTextSegment{}
-	updatafn := func(seg []widget.RichTextSegment) {
-		fyne.Do(func() {
-			g.previewText.Segments = append(g.previewText.Segments, seg...)
-			g.previewText.Refresh()
-		})
+	g.previewPanel.lines = [][]widget.RichTextSegment{}
+	// g.refreshPreviewContent()
+	updateChan := make(chan []widget.RichTextSegment)
+	re, err := BuildRegexPattern(g.searchTerms)
+	if err != nil {
+		print(err.Error())
+		return
 	}
-	fyne.Do(func() {
-		re, err := BuildRegexPattern(g.searchTerms)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for update := range updateChan {
+			g.previewPanel.lines = append(g.previewPanel.lines, update)
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		wg.Done()
+		locations, err := GetDocumentPreview(filePath, re, updateChan)
 		if err != nil {
-			print(err.Error())
 			return
 		}
-		GetDocumentPreview(filePath, re, updatafn)
+		g.locations = locations
+	}()
+	wg.Wait()
+	fyne.Do(func() {
+		g.previewPanel.navBar.Show()
+		g.previewPanel.navBar.Refresh()
+		g.previewPanel.previewList.Refresh()
+		g.gotoMatch(0)
 	})
 }
 
@@ -690,7 +788,7 @@ func (g *GUI) startIndexing(folderPath string) {
 		g.tree = tc
 		g.folderTree.Refresh()
 		g.clearSearch()
-		g.previewText.ParseMarkdown("Index created successfully. Enter search terms to begin searching.")
+		// 	g.previewPanel.previewText.ParseMarkdown("Index created successfully. Enter search terms to begin searching.")
 	}
 }
 
